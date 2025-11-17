@@ -1,1 +1,5 @@
 streamlit
+langchain_core
+langchain_openai
+langchain-google-genai>="3.0.0"
+google-generativeai
