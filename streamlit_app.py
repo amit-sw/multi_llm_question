@@ -1,36 +1,31 @@
-
 import streamlit as st
+import asyncio
+import threading
+import queue
 
-from langchain_openai import ChatOpenAI
-from langchain_google_genai import ChatGoogleGenerativeAI
-
-from google.ai.generativelanguage_v1beta.types import Tool as GenAITool
-
-from openai import OpenAI
+from openai import AsyncOpenAI
 from openai.types import responses as openai_responses
+import google.generativeai as genai
+
+st.set_page_config(page_title="Two LLM Comparator", layout="wide")
 
 
-# ----- Model factory functions -----
+# ------------------------------------------------------------
+# Gemini client (sync)
+# ------------------------------------------------------------
 @st.cache_resource
-def get_openai_llm():
-    """Create a LangChain ChatOpenAI instance using Streamlit secrets."""
-    return ChatOpenAI(
-        model="gpt-4.1-mini",  # change to whatever OpenAI model you want
-        api_key=st.secrets["OPENAI_API_KEY"],
-    )
+def get_gemini_model():
+    genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+    return genai.GenerativeModel("gemini-2.5-flash")
 
 
-@st.cache_resource
-def get_gemini_llm():
-    """Create a LangChain ChatGoogleGenerativeAI instance using Streamlit secrets."""
-    return ChatGoogleGenerativeAI(
-        model="gemini-2.5-flash",  # change to your preferred Gemini model
-        google_api_key=st.secrets["GOOGLE_API_KEY"],
-    )
+# ------------------------------------------------------------
+# OpenAI streaming
+# ------------------------------------------------------------
+async def stream_openai_response(query, container):
+    parallel_api_key = st.secrets["PARALLEL_API_KEY"]
+    openai_api_key = st.secrets["OPENAI_API_KEY"]
 
-def get_openai_response(query):
-    parallel_api_key=st.secrets['PARALLEL_API_KEY']
-    openai_api_key = st.secrets['OPENAI_API_KEY']
     tools = [
         openai_responses.tool_param.Mcp(
             server_label="parallel_web_search",
@@ -41,59 +36,111 @@ def get_openai_response(query):
         )
     ]
 
-    response = OpenAI(
-        api_key=openai_api_key
-    ).responses.create(
+    client = AsyncOpenAI(api_key=openai_api_key)
+    text = ""
+
+    stream = await client.responses.create(
         model="gpt-5-nano",
         input=query,
-        tools=tools
-    )
-    return response.output_text
-
-
-def main():
-    st.title("Two-LLM Answer Comparator")
-    st.caption(
-        "Ask a question once and compare answers from an OpenAI model (left) "
-        "and a Gemini model (right)."
+        tools=tools,
+        stream=True,
     )
 
-    # ----- Question input at the top -----
-    with st.form("question_form"):
-        question = st.text_area(
-            "Your question",
-            placeholder="Type your question here…",
-            height=120,
+    async for event in stream:
+        if event.type == "response.output_text.delta":
+            delta = event.delta or ""
+            text += delta
+            container.markdown(text)
+
+
+# ------------------------------------------------------------
+# Gemini streaming (background thread → queue)
+# ------------------------------------------------------------
+def gemini_worker(query, model, out_queue):
+    try:
+        resp = model.generate_content(
+            query,
+            generation_config={"max_output_tokens": 2048},
+            stream=True,
         )
-        submitted = st.form_submit_button("Get answers")
 
-    if not submitted:
+        for chunk in resp:
+            if hasattr(chunk, "text") and chunk.text:
+                out_queue.put(chunk.text)
+
+    finally:
+        out_queue.put(None)   # sentinel for "done"
+
+
+# ------------------------------------------------------------
+# Parallel orchestrator
+# ------------------------------------------------------------
+async def run_parallel(question, gemini_model, openai_box, gemini_box):
+
+    # thread-safe queue for Gemini tokens
+    q = queue.Queue()
+
+    # Launch Gemini thread
+    thread = threading.Thread(
+        target=gemini_worker,
+        args=(question, gemini_model, q),
+        daemon=True,
+    )
+    thread.start()
+
+    gemini_text = ""
+
+    async def pump_gemini():
+        """Periodically pull from thread queue and update UI."""
+        nonlocal gemini_text
+
+        while True:
+            try:
+                chunk = q.get_nowait()
+            except queue.Empty:
+                await asyncio.sleep(0.01)
+                continue
+
+            if chunk is None:  # worker finished
+                break
+
+            gemini_text += chunk
+            gemini_box.markdown(gemini_text)
+
+    # Run OpenAI + Gemini UI pump in parallel
+    await asyncio.gather(
+        stream_openai_response(question, openai_box),
+        pump_gemini(),
+    )
+
+    thread.join()
+
+
+# ------------------------------------------------------------
+# Streamlit UI
+# ------------------------------------------------------------
+def main():
+    st.title("Ask OpenAI and Gemini")
+
+    with st.form("qform"):
+        question = st.text_area("Your question", height=120)
+        submitted = st.form_submit_button("Submit")
+
+    if not submitted or not question.strip():
         return
 
-    if not question.strip():
-        st.warning("Please enter a question first.")
-        return
+    gemini_model = get_gemini_model()
 
-    # Prepare LLMs
-    openai_llm = get_openai_llm()
-    gemini_llm = get_gemini_llm()
+    with st.spinner("Streaming...", show_time=True):
+        col_left, col_right = st.columns(2)
+        col_left.subheader("🤖 OpenAI")
+        col_right.subheader("✨ Gemini")
 
-    # ----- Two vertical containers / columns -----
-    col_left, col_right = st.columns(2)
-
-    with col_left:
-        st.subheader("OpenAI")
-        with st.spinner("Querying OpenAI model…", show_time=True):
-            # LangChain ChatModels accept either a string or a list of messages
-            response_left = get_openai_response(question)
-        st.markdown(response_left)
-
-    with col_right:
-        st.subheader("Gemini")
-        search_tool = GenAITool(google_search={})
-        with st.spinner("Querying Gemini model…", show_time=True):
-            response_right = gemini_llm.invoke(question, tools=[search_tool] )
-        st.markdown(response_right.content)
+        openai_box = col_left.empty()
+        gemini_box = col_right.empty()
+        asyncio.run(
+            run_parallel(question, gemini_model, openai_box, gemini_box)
+        )
 
 
 if __name__ == "__main__":
